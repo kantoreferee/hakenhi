@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>申請状況比較ツール</title>
+  <style>
+    body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,"Noto Sans JP";padding:20px}
+    label{display:block;margin-top:10px}
+    input[type=text]{width:220px;padding:6px}
+    select{padding:6px}
+    button{padding:6px 12px;margin-left:10px}
+    .row{display:flex;gap:12px;align-items:center}
+    /* Table layout improvements */
+    table{border-collapse:collapse;width:100%;margin-top:16px;table-layout:fixed;font-size:14px}
+    th,td{border:1px solid #ddd;padding:12px;text-align:left;white-space:normal;overflow-wrap:break-word;word-break:break-word;line-height:1.6;vertical-align:top}
+    th{background:#f4f4f4}
+    .statusCell{text-align:center;font-weight:600}
+    .noteCell{font-size:0.95em;color:#333}
+    .ok{background:#e6ffed}
+    .ng{background:#fff2f0}
+    .headingCompact{font-size:1.05rem;margin:0 0 8px 0}
+    .muted{color:#666;font-size:0.9em}
+    .small{font-size:0.9em}
+  </style>
+</head>
+<body>
+  <h1>申請状況比較ツール</h1>
+
+  <div>
+    <label>会員番号 (9桁)
+      <input id="keyInput" type="text" pattern="\d{9}" placeholder="123456789" maxlength="9">
+    </label>
+
+    <label>カテゴリ
+      <select id="categorySelect">
+        <option value="学生">学生</option>
+        <option value="CL">CL</option>
+        <option value="FL">FL</option>
+        <option value="あすなろ">あすなろ</option>
+        <option value="サマー">サマー</option>
+        <option value="ウィンター">ウィンター</option>
+      </select>
+    </label>
+
+    <!-- API URLs are fixed and hidden from the UI -->
+    <!-- 派遣表api -->
+    <input id="needApiUrl" type="hidden" value="https://script.google.com/macros/s/AKfycbyRQgsfLtFgtdnqfSXJgV7jM8I-3y4hFuK1I4OI1nL3Sb5CaE0gerU5xdi1btnmFvvzXA/exec">
+    <!-- 申請実績api -->
+    <input id="appliedApiUrl" type="hidden" value="https://script.google.com/macros/s/AKfycbxwXGdWTF4uxnEUw71dYkviLGgM36P7q1SdR-d_Vzt9Sv4IYihgbGIOVBbMhEiJHTYg/exec">
+
+    <div style="margin-top:10px">
+      <button id="searchBtn">検索</button>
+      <span id="status" class="muted small"></span>
+    </div>
+  </div>
+
+  <div id="resultArea"></div>
+
+  <script>
+    function tryParseJsonOrJsonp(text){
+      text = text && text.trim();
+      if(!text) return null;
+      try{ return JSON.parse(text); }catch(e){
+        // JSONP の可能性: callback(...)
+        var m = text.match(/^[^(]*\((.*)\)\s*;?$/s);
+        if(m && m[1]){
+          try{ return JSON.parse(m[1]); }catch(e2){ return null; }
+        }
+        return null;
+      }
+    }
+
+    function toYMD(v){
+      if(v === null || v === undefined) return '';
+      var s = String(v).trim();
+      if(!s) return '';
+      // If string is full ISO datetime with time (contains 'T'), parse and use local date
+      var mIsoTime = s.match(/^\d{4}-\d{2}-\d{2}T/);
+      if(mIsoTime){
+        var dIso = new Date(s);
+        if(!isNaN(dIso.getTime())){
+          var y = dIso.getFullYear();
+          var mo = ('0'+(dIso.getMonth()+1)).slice(-2);
+          var dd = ('0'+dIso.getDate()).slice(-2);
+          return y + '-' + mo + '-' + dd;
+        }
+      }
+      // If string starts with YYYY-MM-DD (date-only ISO), take it directly
+      var m0 = s.match(/^(\d{4}-\d{2}-\d{2})/);
+      if(m0) return m0[1];
+      // Match YYYY[sep]M[sep]D
+      var m1 = s.match(/^(\d{4})[^0-9]?(\d{1,2})[^0-9]?(\d{1,2})/);
+      if(m1){
+        return m1[1] + '-' + ('0'+m1[2]).slice(-2) + '-' + ('0'+m1[3]).slice(-2);
+      }
+      // Fallback: parse as Date and use UTC components
+      var d = new Date(s);
+      if(!isNaN(d.getTime())){
+        var y = d.getUTCFullYear();
+        var mo = ('0'+(d.getUTCMonth()+1)).slice(-2);
+        var dd = ('0'+d.getUTCDate()).slice(-2);
+        return y + '-' + mo + '-' + dd;
+      }
+      return s;
+    }
+
+    function normalizeNeed(item){
+      if(!item) return null;
+      if(typeof item === 'object' && !Array.isArray(item)){
+        return {date: toYMD(item.date||''), venue: String(item.venue||'').trim(), home: String(item.home||'').trim(), away: String(item.away||'').trim(), matchCount: Number(item.matchCount||0)||0, cancelled: Boolean(item.cancelled), raw: item};
+      }
+      return null;
+    }
+
+    function normalizeApplied(item, category){
+      if(!item) return null;
+      if(Array.isArray(item)){
+        // 優先列: サマー/ウィンター/あすなろ -> J列(index 9)、それ以外 -> P列(index 15)
+        var cnt = 1;
+        var note = '';
+        var numericFound = false;
+        var preferredIdx = (category === 'あすなろ' || category === 'サマー' || category === 'ウィンター') ? 9 : 15;
+
+        // まず優先列をチェック
+        var rawPreferred = item[preferredIdx];
+        if(rawPreferred !== null && rawPreferred !== undefined){
+          var sp = String(rawPreferred).trim();
+          var mp = sp.match(/(\d+)\s*試合/);
+          if(mp && mp[1]){ cnt = parseInt(mp[1],10) || 1; numericFound = true; }
+          else {
+            var mp2 = sp.match(/^\s*(\d+)\s*$/);
+            if(mp2 && mp2[1]){ cnt = parseInt(mp2[1],10) || 1; numericFound = true; }
+            else if(sp){ note = sp; }
+          }
+        }
+
+        // 優先列で見つからなければ配列全体を検索してフォールバック
+        if(!numericFound && !note){
+          for(var i=0;i<item.length;i++){
+            var v = item[i];
+            if(v === null || v === undefined) continue;
+            var s = String(v).trim();
+            if(!s) continue;
+            var m = s.match(/(\d+)\s*試合/);
+            if(m && m[1]){ cnt = parseInt(m[1],10) || 1; numericFound = true; break; }
+            var m2 = s.match(/^\s*(\d+)\s*$/);
+            if(m2 && m2[1]){ cnt = parseInt(m2[1],10) || 1; numericFound = true; break; }
+            if(/中止|試合開始前/.test(s)){
+              note = s;
+            }
+          }
+        }
+        return {date: toYMD(item[4]||''), venue: String(item[5]||'').trim(), home: String(item[7]||'').trim(), away: String(item[8]||'').trim(), matchCount: cnt, note: note, raw: item};
+      }
+      if(typeof item === 'object'){
+        return {date: toYMD(item.date||''), venue: String(item.venue||'').trim(), home: String(item.home||'').trim(), away: String(item.away||'').trim(), raw: item};
+      }
+      return null;
+    }
+
+    // 照合キーは日付のみとする
+    function keyForRow(r){ return (r.date||''); }
+
+    document.getElementById('searchBtn').addEventListener('click', function(){
+      var key = document.getElementById('keyInput').value.trim();
+      var category = document.getElementById('categorySelect').value;
+      var needUrl = document.getElementById('needApiUrl').value.trim();
+      var appliedUrl = document.getElementById('appliedApiUrl').value.trim();
+      var status = document.getElementById('status');
+      var resultArea = document.getElementById('resultArea');
+      resultArea.innerHTML = '';
+      status.textContent = '';
+
+      if(!/^\d{9}$/.test(key)) { status.textContent='会員番号は9桁の数字で入力してください。'; return; }
+      if(!needUrl || !appliedUrl){ status.textContent='両方の API URL を入力してください。'; return; }
+
+      status.textContent = '申請状況を取得しています...';
+
+      var needFull = needUrl + '?key=' + encodeURIComponent(key) + '&category=' + encodeURIComponent(category);
+      var appliedFull = appliedUrl + '?key=' + encodeURIComponent(key) + '&category=' + encodeURIComponent(category);
+
+      Promise.all([
+        fetch(needFull).then(r=>r.text()).then(tryParseJsonOrJsonp).catch(e=>({error:String(e)})),
+        fetch(appliedFull).then(r=>r.text()).then(tryParseJsonOrJsonp).catch(e=>({error:String(e)}))
+      ]).then(function(results){
+        var needResp = results[0];
+        var appliedResp = results[1];
+        status.textContent = '';
+        if(!needResp){ resultArea.innerHTML = '<p>申請必要リスト API の応答が解析できませんでした。</p>'; return; }
+        if(!appliedResp){ resultArea.innerHTML = '<p>申請実績リスト API の応答が解析できませんでした。</p>'; return; }
+
+        if(needResp.error || appliedResp.error){
+          resultArea.innerHTML = '<pre>' + JSON.stringify({need:needResp,applied:appliedResp},null,2) + '</pre>';
+          return;
+        }
+
+        var needList = (needResp.data && Array.isArray(needResp.data.matches)) ? needResp.data.matches.map(normalizeNeed).filter(Boolean) : [];
+        var appliedList = (appliedResp.data && Array.isArray(appliedResp.data.matches)) ? appliedResp.data.matches.map(function(it){ return normalizeApplied(it, category); }).filter(Boolean) : [];
+
+        // If the申請必要レスポンス doesn't contain a name for the member, show explanatory message and stop
+        if (!(needResp.data && needResp.data.name)) {
+          resultArea.innerHTML = '<p>会員番号が見つかりません。入力値を見直してください。入力値に誤りがない場合、審判員名簿の登録・オンライン会員登録システム上の審判員資格の登録のどちらかが実施できていない可能性があります。これらを至急実施してください。</p>';
+          return;
+        }
+
+        // Aggregate required counts per date
+        var needMap = {}; // date -> {required: n, items: [..], cancelledItems:[]}
+        needList.forEach(function(n){
+          var k = keyForRow(n);
+          // If the item is marked cancelled, it should not contribute to required count (treated specially)
+          var cnt = n.cancelled ? 0 : (Number(n.matchCount || n.count || 1) || 1);
+          if(!needMap[k]) needMap[k] = {required:0, items:[], cancelledItems:[]};
+          needMap[k].required += cnt;
+          needMap[k].items.push({info:n, count:cnt});
+          if(n.cancelled) needMap[k].cancelledItems.push(n);
+        });
+
+        // Count applied per date (considering matchCount in applied rows)
+        var appliedCountMap = {}; // date -> count
+        var appliedNoteMap = {}; // date -> [notes]
+        appliedList.forEach(function(a){
+          var k = keyForRow(a);
+          var add = Number(a.matchCount || 1) || 1;
+          appliedCountMap[k] = (appliedCountMap[k] || 0) + add;
+          if(a.note){
+            appliedNoteMap[k] = appliedNoteMap[k] || [];
+            if(appliedNoteMap[k].indexOf(a.note) === -1) appliedNoteMap[k].push(a.note);
+          }
+        });
+
+        // Build display rows by date (union of dates)
+        var allDates = Object.keys(needMap).concat(Object.keys(appliedCountMap).filter(function(d){ return !needMap[d]; }));
+        allDates.sort();
+
+        var rowsHtml = [];
+        var nameOnly = (needResp.data && needResp.data.name) ? String(needResp.data.name) : '';
+        if(nameOnly){
+          rowsHtml.push('<h2 class="headingCompact">派遣費申請状況（' + escapeHtml(nameOnly) + 'さん）</h2>');
+        } else {
+          rowsHtml.push('<h2 class="headingCompact">派遣費申請状況</h2>');
+        }
+        rowsHtml.push('<table>');
+        rowsHtml.push('<colgroup><col style="width:14%"><col style="width:36%"><col style="width:12%"><col style="width:12%"><col style="width:12%"><col style="width:14%"></colgroup>');
+        rowsHtml.push('<tr><th>試合日</th><th>会場</th><th>担当試合数</th><th>申請済試合数</th><th>状態</th><th>備考</th></tr>');
+
+        allDates.forEach(function(date){
+          var req = needMap[date] ? needMap[date].required : 0;
+          var appliedCnt = appliedCountMap[date] || 0;
+          var appliedNotes = appliedNoteMap[date] || [];
+          // collect venues from needMap items (unique)
+          var venues = '';
+          var cancelledLabel = '';
+          if(needMap[date]){
+            var vset = {};
+            needMap[date].items.forEach(function(it){ if(it && it.info && it.info.venue) vset[String(it.info.venue).trim()] = true; });
+            venues = Object.keys(vset).join(' / ');
+            if(needMap[date].cancelledItems && needMap[date].cancelledItems.length>0){
+              cancelledLabel = '試合開始前に中止判断(派遣費なし交通費のみ)';
+            }
+          }
+          var status = '';
+          var note = '';
+          var cls = 'small';
+          if(req > 0){
+            if(appliedCnt === req){
+              status = '申請完了';
+              note = '';
+              cls = 'ok';
+            } else if(appliedCnt > req){
+              status = '申請試合数超過';
+              note = (appliedCnt - req) + ' 件超過';
+              cls = 'ng';
+            } else if(appliedCnt > 0){
+              status = '一部申請済';
+              note = (req - appliedCnt) + ' 件不足';
+              cls = 'ng';
+            } else {
+              status = '未申請';
+              note = '';
+              cls = 'ng';
+            }
+          } else {
+            // req == 0
+            if (needMap[date]) {
+              // 必要リストに存在するが required が 0 の場合（中止等の特殊扱い）
+              // - 申請実績側に同じ中止注記がある場合は「申請完了」とみなす
+              var hasCancelledNote = appliedNotes.some(function(n){ return /中止判断/.test(n); });
+              if (hasCancelledNote) {
+                status = '申請完了';
+                note = '';
+                cls = 'ok';
+              } else if (appliedCnt > 0) {
+                status = '申請試合数超過';
+                note = (appliedCnt - req) + ' 件超過';
+                cls = 'ng';
+              } else {
+                status = '未申請';
+                note = '';
+                cls = 'ng';
+              }
+            } else {
+              // 申請実績はあるが必要リストに存在しない日付 -> 申請誤り
+              status = '申請誤り';
+              note = '申請対象外の日付の試合が申請されています';
+              cls = 'ng';
+            }
+          }
+
+          // 担当試合数は数値のみ表示（中止ラベルは担当欄に出さない）
+          var tantoDisplay = String((req || 0));
+          // 申請済試合数の表示: 注記（中止表記など）があればそれを優先表示
+          var appliedDisplay = appliedNotes.length ? appliedNotes.join(' / ') : appliedCnt;
+          rowsHtml.push('<tr class="'+cls+'"><td>' + escapeHtml(date) + '</td><td>' + escapeHtml(venues) + '</td><td>' + escapeHtml(tantoDisplay) + '</td><td>' + escapeHtml(appliedDisplay) + '</td><td class="statusCell">' + status + '</td><td class="noteCell">' + escapeHtml(note) + '</td></tr>');
+        });
+
+        rowsHtml.push('</table>');
+        rowsHtml.push('<p class="muted small">申請を誤っている場合は、正しい申請を行ってください。誤った申請は審判部側で取り消しますので、その旨ご連絡ください。<br>申請期限後に申請されたものについても、一律で「申請完了」と表示されますが、交通費の精算対象外となることがあります。<br>その他、不明点なども以下の宛先までメールをお願いします。<br>kantolax-info-ref@googlegroups.com</p>');
+        resultArea.innerHTML = rowsHtml.join('\n');
+
+      }).catch(function(err){
+        status.textContent = '';
+        resultArea.innerHTML = '<pre>' + String(err) + '</pre>';
+      });
+
+    });
+
+    function escapeHtml(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  </script>
+</body>
+</html>
